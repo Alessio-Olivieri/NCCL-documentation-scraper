@@ -1,0 +1,1356 @@
+################
+Overview of NCCL
+################
+
+The NVIDIA Collective Communications Library (NCCL, pronounced âNickelâ) is a library providing inter-GPU communication primitives that are topology-aware and can be easily integrated into applications.  
+
+NCCL implements both collective communication and point-to-point send/receive primitives. It is not a full-blown parallel programming framework; rather, it is a library focused on accelerating inter-GPU communication.
+
+NCCL provides the following collective communication primitives :
+
+* AllReduce
+* Broadcast
+* Reduce
+* AllGather
+* ReduceScatter
+
+Additionally, it allows for point-to-point send/receive communication which allows for scatter, gather, or all-to-all operations.
+
+Tight synchronization between communicating processors is a key aspect of collective communication. CUDA based collectives would traditionally be realized through a combination of CUDA memory copy operations and CUDA kernels for local reductions. NCCL, on the other hand, implements each collective in a single kernel handling both communication and computation operations. This allows for fast synchronization and minimizes the resources needed to reach peak bandwidth.
+
+NCCL conveniently removes the need for developers to optimize their applications for specific machines. NCCL provides fast collectives over multiple GPUs both within and across nodes. It supports a variety of interconnect technologies including PCIe, NVLINK, InfiniBand Verbs, and IP sockets.
+
+Next to performance, ease of programming was the primary consideration in the design of NCCL. NCCL uses a simple C API, which can be easily accessed from a variety of programming languages. NCCL closely follows the popular collectives API defined by MPI (Message Passing Interface). Anyone familiar with MPI will thus find NCCLâs API very natural to use. In a minor departure from MPI, NCCL collectives take a âstreamâ argument which provides direct integration with the CUDA programming model. Finally, NCCL is compatible with virtually any multi-GPU parallelization model, for example:
+
+* single-threaded control of all GPUs
+* multi-threaded, for example, using one thread per GPU
+* multi-process, for example, MPI
+ 
+NCCL has found great application in Deep Learning Frameworks, where the AllReduce collective is heavily used for neural network training. Efficient scaling of neural network training is possible with the multi-GPU and multi node communication provided by NCCL.
+
+
+
+
+#####
+Setup
+#####
+
+NCCL is a communication library providing optimized GPU-to-GPU communication for high-performance applications.
+It is not, like MPI, providing a parallel environment including a process launcher and manager. NCCL relies therefore
+on the application's process management system and CPU-side communication system for its own bootstrap.
+
+Similarly to MPI and other libraries which are optimized for performance, NCCL does not provide secure network
+communication between GPUs. It is therefore the responsibility of the user to ensure NCCL operates over a secure network,
+both for bootstrap (controlled by :ref:`NCCL_SOCKET_IFNAME`) and for high-speed communication.
+
+##########
+Using NCCL
+##########
+
+Using NCCL is similar to using any other library in your code:
+
+1. Install the NCCL library on your system
+
+2. Modify your application to link to that library
+
+3. Include the header file nccl.h in your application
+
+4. Create a communicator (see :ref:`communicator-label`)
+
+5. Use NCCL collective communication primitives to perform data communication. You can familiarize yourself with the :ref:`api-label` documentation to maximize your usage performance.
+
+Collective communication primitives are common patterns of data transfer among a group of CUDA devices. A communication algorithm involves many processors that are communicating together.  
+Each CUDA device is identified within the communication group by a zero-based index or rank. Each rank uses a communicator object to refer to the collection of GPUs that are intended to work together. 
+The creation of a communicator is the first step needed before launching any communication operation.
+
+.. toctree::
+
+ usage/communicators
+ usage/collectives
+ usage/data
+ usage/streams
+ usage/groups
+ usage/p2p
+ usage/threadsafety
+ usage/inplace
+ usage/cudagraph
+ usage/bufferreg
+
+.. _communicator-label:
+
+***********************
+Creating a Communicator
+***********************
+
+When creating a communicator, a unique rank between 0 and n-1 has to be assigned to each of the n CUDA devices which
+are part of the communicator. Using the same CUDA device multiple times as different ranks of the same NCCL
+communicator is not supported and may lead to hangs.
+
+Given a static mapping of ranks to CUDA devices, the :c:func:`ncclCommInitRank`, :c:func:`ncclCommInitRankConfig` and
+:c:func:`ncclCommInitAll` functions will create communicator objects, each communicator object being associated to a
+fixed rank and CUDA device. Those objects will then be used to launch communication operations.
+
+Before calling :c:func:`ncclCommInitRank`, you need to first create a unique object which will be used by all processes
+and threads to synchronize and understand they are part of the same communicator. This is done by calling the
+:c:func:`ncclGetUniqueId` function.
+
+The :c:func:`ncclGetUniqueId` function returns an ID which has to be broadcast to all participating threads and
+processes using any CPU communication system, for example, passing the ID pointer to multiple threads, or broadcasting
+it to other processes using MPI or another parallel environment using, for example, sockets.
+
+You can also call the ncclCommInitAll operation to create n communicator objects at once within a single process. As it
+is limited to a single process, this function does not permit inter-node communication. ncclCommInitAll is equivalent
+to calling a combination of ncclGetUniqueId and ncclCommInitRank.
+
+The following sample code is a simplified implementation of ncclCommInitAll.
+
+.. code:: C
+
+ ncclResult_t ncclCommInitAll(ncclComm_t* comm, int ndev, const int* devlist) {
+   ncclUniqueId Id;
+   ncclGetUniqueId(&Id);
+   ncclGroupStart();
+   for (int i=0; i<ndev; i++) {
+     cudaSetDevice(devlist[i]);
+     ncclCommInitRank(comm+i, ndev, Id, i);
+   }
+   ncclGroupEnd();
+ }
+
+Related links:
+
+ * :c:func:`ncclCommInitAll`
+ * :c:func:`ncclGetUniqueId`
+ * :c:func:`ncclCommInitRank`
+
+.. _init-rank-config:
+
+Creating a communicator with options
+-------------------------------------
+
+The :c:func:`ncclCommInitRankConfig` function allows to create a NCCL communicator with specific options.
+
+The config parameters NCCL supports are listed here :ref:`ncclconfig`.
+
+For example, "blocking" can be set to 0 to ask NCCL to never block in any NCCL call, and at the same time
+other config parameters can be set as well to more precisely define communicator behavior. A simple example
+code is shown below:
+
+.. code:: C
+
+  ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+  config.blocking = 0;
+  config.minCTAs = 4;
+  config.maxCTAs = 16;
+  config.cgaClusterSize = 2;
+  config.netName = "Socket";
+  CHECK(ncclCommInitRankConfig(&comm, nranks, id, rank, &config));
+  do {
+    CHECK(ncclCommGetAsyncError(comm, &state));
+    // Handle outside events, timeouts, progress, ...
+  } while(state == ncclInProgress);
+
+Related link: :c:func:`ncclCommGetAsyncError`
+
+Creating a communicator using multiple ncclUniqueIds
+----------------------------------------------------
+
+The :c:func:`ncclCommInitRankScalable` function enables the creation of a NCCL communicator using many ncclUniqueIds.
+All NCCL ranks have to provide the same array of ncclUniqueIds (same ncclUniqueIds, and in with the same order).
+For the best performance, we recommend distributing the ncclUniqueIds as evenly as possible amongst the NCCL ranks.
+
+Internally, NCCL ranks will mostly communicate with a single ncclUniqueId.
+Therefore, to obtain the best results, we recommend to evenly distribute ncclUniqueIds accross the ranks.
+
+The following function can be used to decide if a NCCL rank should create a ncclUniqueIds:
+
+.. code:: C
+
+ bool rankHasRoot(const int rank, const int nRanks, const int nIds) {
+   const int rmr = nRanks % nIds;
+   const int rpr = nRanks / nIds;
+   const int rlim = rmr * (rpr+1);
+   if (rank < rlim) {
+     return !(rank % (rpr + 1));
+   } else {
+     return !((rank - rlim) % rpr);
+   }
+ }
+
+For example, if 3 ncclUniqueIds are to be distributed accross 7 NCCL ranks, the first ncclUniqueId will be associated to
+ranks 0-2, while the others will be associated to ranks 3-4, and 5-6.
+This function will therefore return true on rank 0, 3, and 5, and false otherwise.
+
+Note: only the first ncclUniqueId will be used to create the communicator hash id, which is used to identify the
+communicator in the log file and in the replay tool.
+
+Creating more communicators
+---------------------------
+
+The ncclCommSplit function can be used to create communicators based on an existing one. This allows to split an existing
+communicator into multiple sub-partitions, duplicate an existing communicator, or even create a single communicator with
+fewer ranks.
+
+The ncclCommSplit function needs to be called by all ranks in the original communicator. If some ranks will not be part
+of any sub-group, they still need to call ncclCommSplit with color being NCCL_SPLIT_NOCOLOR.
+
+Newly created communicators will inherit the parent communicator configuration (e.g. non-blocking).
+If the parent communicator operates in non-blocking mode, a ncclCommSplit operation may be stopped by calling ncclCommAbort
+on the parent communicator, then on any new communicator returned. This is because a hang could happen during
+operations on any of the two communicators.
+
+The following code duplicates an existing communicator:
+
+.. code:: C
+
+ int rank;
+ ncclCommUserRank(comm, &rank);
+ ncclCommSplit(comm, 0, rank, &newcomm, NULL);
+
+This splits a communicator in two halves:
+
+.. code:: C
+
+ int rank, nranks;
+ ncclCommUserRank(comm, &rank);
+ ncclCommCount(comm, &nranks);
+ ncclCommSplit(comm, rank/(nranks/2), rank%(nranks/2), &newcomm, NULL);
+
+This creates a communicator with only the first 2 ranks:
+
+.. code:: C
+
+ int rank;
+ ncclCommUserRank(comm, &rank);
+ ncclCommSplit(comm, rank<2 ? 0 : NCCL_SPLIT_NOCOLOR, rank, &newcomm, NULL);
+
+
+Related links:
+
+ * :c:func:`ncclCommSplit`
+
+Using multiple NCCL communicators concurrently
+----------------------------------------------
+
+Using multiple NCCL communicators requires careful synchronization, or can lead to deadlocks.
+
+NCCL kernels are blocking (waiting for data to arrive), and any CUDA operation can cause a device synchronization,
+meaning it will wait for all NCCL kernels to complete. This can quickly lead to deadlocks since NCCL operations perform
+CUDA calls themselves.
+
+Operations on different communicators should therefore be used at different epochs with a locking mechanism, and
+applications should ensure operations are submitted in the same order across ranks.
+
+Launching multiple communication operations (on different streams) might work provided they can fit within the GPU, but
+could break at any time if NCCL were to use more CUDA blocks per operation, or if some calls used inside NCCL
+collectives were to perform a device synchronization (e.g. allocate some CUDA memory dynamically).
+
+Finalizing a communicator
+-------------------------
+
+ncclCommFinalize will transition a communicator from the *ncclSuccess* state to the *ncclInProgress* state, start
+completing all operations in the background and synchronize with other ranks which may be using resources for their
+communications with other ranks.
+All uncompleted operations and network-related resources associated to a communicator will be flushed and freed with
+ncclCommFinalize.
+Once all NCCL operations are complete, the communicator will transition to the *ncclSuccess* state. Users can
+query that state with ncclCommGetAsyncError.
+If a communicator is marked as nonblocking, this operation is nonblocking; otherwise, it is blocking.
+
+Related link: :c:func:`ncclCommFinalize`
+
+Destroying a communicator
+-------------------------
+
+Once a communicator has been finalized, the next step is to free all resources, including the communicator itself.
+Local resources associated to a communicator can be destroyed with ncclCommDestroy. If the state of a communicator
+is *ncclSuccess* when calling ncclCommDestroy, the call is guaranteed to be nonblocking; otherwise
+ncclCommDestroy might block.
+In all cases, ncclCommDestroy call will free the resources of the communicator and return, and
+the communicator should no longer be accessed after ncclCommDestroy returns.
+
+Related link: :c:func:`ncclCommDestroy`
+
+*************************************
+Error handling and communicator abort
+*************************************
+
+All NCCL calls return a NCCL error code which is sumarized in the table below. If a NCCL call returns an error code
+different from ncclSuccess and ncclInternalError, and if NCCL_DEBUG is set to WARN, NCCL will print a human-readable
+message explaining what happened.
+If NCCL_DEBUG is set to INFO, NCCL will also print the call stack which led to the error.
+This message is intended to help the user fix the problem.
+
+The table below summarizes how different errors should be understood and handled. Each case is explained in details
+in the following sections.
+
+.. list-table:: NCCL Errors
+   :widths: 20 50 10 10 10
+   :header-rows: 1
+
+   * - Error
+     - Description
+     - Resolution
+     - Error handling
+     - Group behavior
+   * - ncclSuccess
+     - No error
+     - None
+     - None
+     - None
+   * - ncclUnhandledCudaError
+     - Error during a CUDA call (1)
+     - CUDA configuration / usage (1)
+     - Communicator abort (5)
+     - Global (6)
+   * - ncclSystemError
+     - Error during a system call (1)
+     - System configuration / usage (1)
+     - Communicator abort (5)
+     - Global (6)
+   * - ncclInternalError
+     - Error inside NCCL (2)
+     - Fix in NCCL (2)
+     - Communicator abort (5)
+     - Global (6)
+   * - ncclInvalidArgument
+     - An argument to a NCCL call is invalid (3)
+     - Fix in the application (3)
+     - None (3)
+     - Individual (3)
+   * - ncclInvalidUsage
+     - The usage of NCCL calls is invalid (4)
+     - Fix in the application (4)
+     - Communicator abort (5)
+     - Global (6)
+   * - ncclInProgress
+     - The NCCL call is still in progress
+     - Poll for completion using ncclCommGetAsyncError
+     - None
+     - None
+
+
+(1) ncclUnhandledCudaError and ncclSystemError indicate that a call NCCL made to an external component failed,
+which caused the NCCL operation to fail. The error message should explain which component the user should look
+at and try to fix, potentially with the help of the administrators of the system.
+
+(2) ncclInternalError denotes a NCCL bug. It might not report a message with NCCL_DEBUG=WARN since it requires a
+fix in the NCCL source code. NCCL_DEBUG=INFO will print the back trace which led to the error.
+
+(3) ncclInvalidArgument indicates an argument value is incorrect, like a NULL pointer or an out-of-bounds value.
+When this error is returned, the NCCL call had no effect. The group state remains unchanged, the communicator is
+still functioning normally. The application can call ncclCommAbort or continue as if the call did not happen.
+This error will be returned immediately for a call happening within a group and applies to that specific NCCL
+call. It will not be returned by ncclGroupEnd since ncclGroupEnd takes no argument.
+
+(4) ncclInvalidUsage is returned when a dynamic condition causes a failure, which denotes an incorrect usage of
+the NCCL API.
+
+(5) These errors are fatal for the communicator. To recover, the application needs to call ncclCommAbort on the
+communicator and re-create it.
+
+(6) Dynamic errors for operations within a group are always reported by ncclGroupEnd and apply to all operations
+within the group, which may or may not have completed. The application must call ncclCommAbort on all communicators
+within the group.
+
+Asynchronous errors and error handling
+--------------------------------------
+
+Some communication errors, and in particular network errors, are reported through the ncclCommGetAsyncError function.
+Operations experiencing an asynchronous error will usually not progress and never complete. When an asynchronous error
+happens, the operation should be aborted and the communicator destroyed using ncclCommAbort.
+When waiting for NCCL operations to complete, applications should call ncclCommGetAsyncError and destroy the
+communicator when an error happens.
+
+The following code shows how to wait on NCCL operations and poll for asynchronous errors, instead of using
+cudaStreamSynchronize.
+
+.. code:: C
+
+ int ncclStreamSynchronize(cudaStream_t stream, ncclComm_t comm) {
+   cudaError_t cudaErr;
+   ncclResult_t ncclErr, ncclAsyncErr;
+   while (1) {
+    cudaErr = cudaStreamQuery(stream);
+    if (cudaErr == cudaSuccess)
+      return 0;
+
+    if (cudaErr != cudaErrorNotReady) {
+      printf("CUDA Error : cudaStreamQuery returned %d\n", cudaErr);
+      return 1;
+    }
+
+    ncclErr = ncclCommGetAsyncError(comm, &ncclAsyncErr);
+    if (ncclErr != ncclSuccess) {
+      printf("NCCL Error : ncclCommGetAsyncError returned %d\n", ncclErr);
+      return 1;
+    }
+
+    if (ncclAsyncErr != ncclSuccess) {
+      // An asynchronous error happened. Stop the operation and destroy
+      // the communicator
+      ncclErr = ncclCommAbort(comm);
+      if (ncclErr != ncclSuccess)
+        printf("NCCL Error : ncclCommDestroy returned %d\n", ncclErr);
+      // Caller may abort or try to create a new communicator.
+      return 2;
+    }
+
+    // We might want to let other threads (including NCCL threads) use the CPU.
+    sched_yield();
+   }
+ }
+
+Related links:
+
+ * :c:func:`ncclCommGetAsyncError`
+ * :c:func:`ncclCommAbort`
+
+.. _ft:
+
+***************
+Fault Tolerance
+***************
+
+NCCL provides a set of features to allow applications to recover from fatal errors such as a network failure,
+a node failure, or a process failure. When such an error happens, the application should be able to call ncclCommAbort
+on the communicator to free all resources, then create a new communicator to continue.
+All NCCL calls can be non-blocking to ensure ncclCommAbort can be called at any point, during initialization,
+communication or when finalizing the communicator.
+
+To correctly abort, when any rank in a communicator fails (e.g., due to a segmentation fault), all other ranks need to
+call *ncclCommAbort* to abort their own NCCL communicator.
+Users can implement methods to decide when and whether to abort the communicators and restart the NCCL operation.
+Here is an example showing how to initialize and split a communicator in a non-blocking manner, allowing for an abort at any point:
+
+.. code:: C
+
+  bool globalFlag;
+  bool abortFlag = false;
+  ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+  config.blocking = 0;
+  CHECK(ncclCommInitRankConfig(&comm, nRanks, id, myRank, &config));
+  do {
+    CHECK(ncclCommGetAsyncError(comm, &state));
+  } while(state == ncclInProgress && checkTimeout() != true);
+
+  if (checkTimeout() == true || state != ncclSuccess) abortFlag = true;
+
+  /* sync abortFlag among all healthy ranks. */
+  reportErrorGlobally(abortFlag, &globalFlag);
+
+  if (globalFlag) {
+    /* time is out or initialization failed: every rank needs to abort and restart. */
+    ncclCommAbort(comm);
+    /* restart NCCL; this is a user implemented function, it might include
+     * resource cleanup and ncclCommInitRankConfig() to create new communicators. */
+    restartNCCL(&comm);
+  }
+
+  /* nonblocking communicator split. */
+  CHECK(ncclCommSplit(comm, color, key, &childComm, &config));
+  do {
+    CHECK(ncclCommGetAsyncError(comm, &state));
+  } while(state == ncclInProgress && checkTimeout() != true);
+
+  if (checkTimeout() == true || state != ncclSuccess) abortFlag = true;
+
+  /* sync abortFlag among all healthy ranks. */
+  reportErrorGlobally(abortFlag, &globalFlag);
+
+  if (globalFlag) {
+    ncclCommAbort(comm);
+    /* if chilComm is not NCCL_COMM_NULL, user should abort child communicator
+     * here as well for resource reclamation. */
+    if (childComm != NCCL_COMM_NULL) ncclCommAbort(childComm);
+    restartNCCL(&comm);
+  }
+  /* application workload */
+
+The *checkTimeout* function needs to be provided by users to determine what is the longest time the application should wait for
+NCCL initialization; likewise, users can apply other methods to detect errors besides a timeout function. Similar methods can be applied
+to NCCL finalization as well.
+
+*********************
+Collective Operations
+*********************
+
+Collective operations have to be called for each rank (hence CUDA device), using the same count and the same datatype, to form a complete collective operation.
+Failure to do so will result in undefined behavior, including hangs, crashes, or data corruption.
+
+.. _allreduce:
+
+AllReduce
+---------
+
+The AllReduce operation performs reductions on data (for example, sum, min, max) across devices and stores the result in the receive buffer of every rank.
+
+In a *sum* allreduce operation between *k* ranks, each rank will provide an array in of N values, and receive identical results in array out of N values,
+where out[i] = in0[i]+in1[i]+â¦+in(k-1)[i].
+
+.. figure:: images/allreduce.png
+ :align: center
+ 
+ All-Reduce operation: each rank receives the reduction of input values across ranks.
+
+Related links: :c:func:`ncclAllReduce`.
+
+.. _broadcast:
+
+Broadcast
+---------
+
+The Broadcast operation copies an N-element buffer from the root rank to all the ranks.
+
+.. figure:: images/broadcast.png
+ :align: center
+ 
+ Broadcast operation: all ranks receive data from a ârootâ rank. 
+
+Important note: The root argument is one of the ranks, not a device number, and is therefore impacted by a different rank to device mapping.
+
+Related links: :c:func:`ncclBroadcast`.
+
+.. _reduce:
+
+Reduce
+------
+
+The Reduce operation performs the same operation as AllReduce, but stores the result only in the receive buffer of a specified root rank.
+
+.. figure:: images/reduce.png
+ :align: center
+ 
+ Reduce operation: one rank receives the reduction of input values across ranks.
+
+Important note: The root argument is one of the ranks (not a device number), and is therefore impacted by a different rank to device mapping.
+
+Note: A Reduce, followed by a Broadcast, is equivalent to the AllReduce operation.
+
+Related links: :c:func:`ncclReduce`.
+
+.. _allgather:
+
+AllGather
+---------
+
+The AllGather operation gathers N values from k ranks into an output buffer of size k*N, and distributes that result to all ranks.
+
+The output is ordered by the rank index. The AllGather operation is therefore impacted by a different rank to device mapping.
+
+.. figure:: images/allgather.png
+ :align: center
+ 
+ AllGather operation: each rank receives the aggregation of data from all ranks in the order of the ranks. 
+
+Note: Executing ReduceScatter, followed by AllGather, is equivalent to the AllReduce operation.
+
+Related links: :c:func:`ncclAllGather`.
+
+.. _reducescatter:
+
+ReduceScatter
+-------------
+
+The ReduceScatter operation performs the same operation as Reduce, except that the result is scattered in equal-sized blocks between ranks,
+each rank getting a chunk of data based on its rank index.
+
+The ReduceScatter operation is impacted by a different rank to device mapping since the ranks determine the data layout.
+
+.. figure:: images/reducescatter.png
+ :align: center
+
+ Reduce-Scatter operation: input values are reduced across ranks, with each rank receiving a subpart of the result.
+
+
+Related links: :c:func:`ncclReduceScatter`
+
+*************
+Data Pointers
+*************
+
+In general NCCL  will accept any CUDA pointers that are accessible from the CUDA device associated to the communicator object. This includes:
+
+ * device memory local to the CUDA device
+ * host memory registered using CUDA SDK APIs cudaHostRegister or cudaGetDevicePointer
+ * managed and unified memory
+
+The only exception is device memory located on another device but accessible from the current device using peer access. NCCL will return an error in that case to avoid programming errors (only when NCCL_CHECK_POINTERS=1 since 2.2.12).
+
+
+*********************
+CUDA Stream Semantics
+*********************
+
+
+NCCL calls are associated to a stream which is passed as the last argument of the collective communication function. The NCCL call returns when the operation has been effectively enqueued to the given stream, or returns an error. The collective operation is then executed asynchronously on the CUDA device. The operation status can be queried using standard CUDA semantics, for example, calling cudaStreamSynchronize or using CUDA events.
+
+
+Mixing Multiple Streams within the same ncclGroupStart/End() group
+------------------------------------------------------------------
+
+NCCL allows for using multiple streams within a group call. This will enforce
+a stream dependency of all streams before the NCCL kernel starts and block all
+streams until the NCCL kernel completes.
+
+It will behave as if the NCCL group operation was posted on every stream, but
+given it is a single operation, it will cause a global synchronization point
+between the streams.
+
+.. _group-calls:
+
+***********
+Group Calls
+***********
+
+Group functions (ncclGroupStart/ncclGroupEnd) can be used to merge multiple calls into one. This is needed for
+three purposes: managing multiple GPUs from one thread (to avoid deadlocks), aggregating communication operations
+to improve performance, or merging multiple send/receive point-to-point operations (see :ref:`point-to-point`
+section). All three usages can be combined together, with one exception : calls to :c:func:`ncclCommInitRank`
+cannot be merged with others.
+
+Management Of Multiple GPUs From One Thread
+-------------------------------------------
+
+When a single thread is managing multiple devices, group semantics must be used.
+This is because every NCCL call may have to block, waiting for other threads/ranks to arrive, before effectively posting the NCCL operation on the given stream. Hence, a simple loop on multiple devices like shown below could block on the first call waiting for the other ones:
+
+.. code:: C
+
+ for (int i=0; i<nLocalDevs; i++) {
+   ncclAllReduce(..., comm[i], stream[i]);
+ }
+
+To define that these calls are part of the same collective operation, ncclGroupStart and ncclGroupEnd should be used: 
+
+.. code:: C
+
+  ncclGroupStart();
+  for (int i=0; i<nLocalDevs; i++) {
+    ncclAllReduce(..., comm[i], stream[i]);
+  }
+  ncclGroupEnd();
+
+This will tell NCCL to treat all calls between ncclGroupStart and ncclGroupEnd as a single call to many devices. 
+
+Caution: When called inside a group, stream operations (like ncclAllReduce) can return without having enqueued the
+operation on the stream. Stream operations like cudaStreamSynchronize can therefore be called only after ncclGroupEnd
+returns.
+
+Group calls must also be used to create a communicator when one thread manages more than one device:
+
+.. code:: C
+
+  ncclGroupStart();
+  for (int i=0; i<nLocalDevs; i++) {
+    cudaSetDevice(device[i]);
+    ncclCommInitRank(comms+i, nranks, commId, rank[i]);
+  }
+  ncclGroupEnd();
+
+
+Note: Contrary to NCCL 1.x, there is no need to set the CUDA device before every NCCL communication call within a group,
+but it is still needed when calling ncclCommInitRank within a group.
+
+Related links:
+
+* :c:func:`ncclGroupStart`
+* :c:func:`ncclGroupEnd`
+
+Aggregated Operations (2.2 and later)
+-------------------------------------
+
+The group semantics can also be used to have multiple collective operations performed within a single NCCL launch. This
+is useful for reducing the launch overhead, in other words, latency, as it only occurs once for multiple operations.
+Init functions cannot be aggregated with other init functions, nor with communication functions.
+
+Aggregation of collective operations can be done simply by having multiple calls to NCCL within a ncclGroupStart /
+ncclGroupEnd section.
+
+In the following example, we launch one broadcast and two allReduce operations together as a single NCCL launch.
+
+.. code:: C
+
+ ncclGroupStart();
+ ncclBroadcast(sendbuff1, recvbuff1, count1, datatype, root, comm, stream);
+ ncclAllReduce(sendbuff2, recvbuff2, count2, datatype, comm, stream);
+ ncclAllReduce(sendbuff3, recvbuff3, count3, datatype, comm, stream);
+ ncclGroupEnd();
+
+It is permitted to combine aggregation with multi-GPU launch and use different communicators in a group launch
+as shown in the Management Of Multiple GPUs From One Thread topic.  When combining multi-GPU launch and aggregation,
+ncclGroupStart and ncclGroupEnd can be either used once or at each level. The following example groups the allReduce
+operations from different layers and on multiple CUDA devices :
+
+.. code:: C
+
+ ncclGroupStart();
+ for (int i=0; i<nlayers; i++) {
+   ncclGroupStart();
+   for (int g=0; g<ngpus; g++) {
+     ncclAllReduce(sendbuffs[g]+offsets[i], recvbuffs[g]+offsets[i], counts[i], datatype[i], comms[g], streams[g]);
+   }
+   ncclGroupEnd();
+ }
+ ncclGroupEnd();
+
+Note: The NCCL operation will only be started as a whole during the last call to ncclGroupEnd. The ncclGroupStart and
+ncclGroupEnd calls within the for loop are not necessary and do nothing.
+
+Related links:
+
+* :c:func:`ncclGroupStart`
+* :c:func:`ncclGroupEnd`
+
+Nonblocking Group Operation
+-------------------------------------
+
+If a communicator is marked as nonblocking through ncclCommInitRankConfig, the group functions become asynchronous 
+correspondingly. In this case, if users issue multiple NCCL operations in one group, returning from ncclGroupEnd() might 
+not mean the NCCL communication kernels have been issued to CUDA streams. If ncclGroupEnd() returns ncclSuccess, it means 
+NCCL kernels have been issued to streams; if it returns ncclInProgress, it means NCCL kernels are being issued to streams 
+in the background. It is users' responsibility to make sure the state of the communicator changes into ncclSuccess 
+before calling related CUDA calls (e.g. cudaStreamSynchronize):
+
+.. code:: C
+
+ ncclGroupStart();
+   for (int g=0; g<ngpus; g++) {
+     ncclAllReduce(sendbuffs[g]+offsets[i], recvbuffs[g]+offsets[i], counts[i], datatype[i], comms[g], streams[g]);
+   }
+ ret = ncclGroupEnd();
+ if (ret == ncclInProgress) {
+    for (int g=0; g<ngpus; g++) {
+      do {
+        ncclCommGetAsyncError(comms[g], &state);
+      } while (state == ncclInProgress);
+    }
+ } else if (ret == ncclSuccess) {
+    /* Successfully issued */
+    printf("NCCL kernel issue succeeded\n");
+ } else {
+    /* Errors happen */
+    reportErrorAndRestart();
+ }
+ 
+ for (int g=0; g<ngpus; g++) {
+   cudaStreamSynchronize(streams[g]);
+ }
+
+Related links:
+
+* :c:func:`ncclCommInitRankConfig`
+* :c:func:`ncclCommGetAsyncError`
+
+.. _point-to-point:
+
+****************************
+Point-to-point communication
+****************************
+
+(Since NCCL 2.7)
+Point-to-point communication can be used to express any communication pattern between ranks.
+Any point-to-point communication needs two NCCL calls : a call to :c:func:`ncclSend` on one
+rank and a corresponding :c:func:`ncclRecv` on the other rank, with the same count and data
+type.
+
+Multiple calls to :c:func:`ncclSend` and :c:func:`ncclRecv` targeting different peers
+can be fused together with :c:func:`ncclGroupStart` and :c:func:`ncclGroupEnd` to form more
+complex communication patterns such as one-to-all (scatter), all-to-one (gather),
+all-to-all or communication with neighbors in an N-dimensional space.
+
+Point-to-point calls within a group will be blocking until that group of calls completes,
+but calls within a group can be seen as progressing independently, hence should never block
+each other. It is therefore important to merge calls that need to progress concurrently to
+avoid deadlocks.
+
+Below are a few examples of classic point-to-point communication patterns used by parallel
+applications. NCCL semantics allow for all variants with different sizes,
+datatypes, and buffers, per rank.
+
+Sendrecv
+--------
+
+In MPI terms, a sendrecv operation is when two ranks exchange data, both sending and receiving
+at the same time. This can be done by merging both ncclSend and ncclRecv calls into one :
+
+.. code:: C
+
+ ncclGroupStart();
+ ncclSend(sendbuff, sendcount, sendtype, peer, comm, stream);
+ ncclRecv(recvbuff, recvcount, recvtype, peer, comm, stream);
+ ncclGroupEnd();
+
+One-to-all (scatter)
+--------------------
+
+A one-to-all operation from a ``root`` rank can be expressed by merging all send and receive
+operations in a group :
+
+.. code:: C
+
+ ncclGroupStart();
+ if (rank == root) {
+   for (int r=0; r<nranks; r++)
+     ncclSend(sendbuff[r], size, type, r, comm, stream);
+ }
+ ncclRecv(recvbuff, size, type, root, comm, stream);
+ ncclGroupEnd();
+
+All-to-one (gather)
+-------------------
+
+Similarly, an all-to-one operations to a ``root`` rank would be implemented this way :
+
+.. code:: C
+
+ ncclGroupStart();
+ if (rank == root) {
+   for (int r=0; r<nranks; r++)
+     ncclRecv(recvbuff[r], size, type, r, comm, stream);
+ }
+ ncclSend(sendbuff, size, type, root, comm, stream);
+ ncclGroupEnd();
+
+All-to-all
+----------
+
+An all-to-all operation would be a merged loop of send/recv operations
+to/from all peers :
+
+.. code:: C
+
+ ncclGroupStart();
+ for (int r=0; r<nranks; r++) {
+   ncclSend(sendbuff[r], sendcount, sendtype, r, comm, stream);
+   ncclRecv(recvbuff[r], recvcount, recvtype, r, comm, stream);
+ }
+ ncclGroupEnd();
+
+Neighbor exchange
+-----------------
+
+Finally, exchanging data with neighbors in an N-dimensions space could be done
+with :
+
+.. code:: C
+
+ ncclGroupStart();
+ for (int d=0; d<ndims; d++) {
+   ncclSend(sendbuff[d], sendcount, sendtype, next[d], comm, stream);
+   ncclRecv(recvbuff[d], recvcount, recvtype, prev[d], comm, stream);
+ }
+ ncclGroupEnd();
+
+
+*************
+Thread Safety
+*************
+
+NCCL primitives are generally not thread-safe, however, they are reentrant. Multiple threads should use separate communicator objects.
+
+
+
+.. _in-place-operations:
+
+*******************
+In-place Operations
+*******************
+
+Contrary to MPI, NCCL does not define a special "in-place" value to replace pointers. Instead, NCCL optimizes the case where the provided pointers are effectively "in place".
+
+For ncclBroadcast, ncclReduce and ncclAllreduce functions, this means that passing ``sendBuff == recvBuff`` will perform in place operations,
+storing final results at the same place as initial data was read from.
+
+For ncclReduceScatter and ncclAllGather, in place operations are done when the per-rank pointer is located at the rank offset of the global buffer.
+More precisely, these calls are considered in place : ::
+
+  ncclReduceScatter(data, data+rank*recvcount, recvcount, datatype, op, comm, stream);
+  ncclAllGather(data+rank*sendcount, data, sendcount, datatype, op, comm, stream);
+
+
+.. _using-nccl-with-cuda-graphs:
+
+***************************
+Using NCCL with CUDA Graphs
+***************************
+
+Starting with NCCL 2.9, NCCL operations can be captured by CUDA Graphs.
+
+CUDA Graphs provide a way to define workflows as graphs rather than single operations. They may reduce overhead by launching multiple GPU operations through a single CPU operation. More details about CUDA Graphs can be found in the `CUDA Programming Guide <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs>`_.
+
+NCCL's collective, P2P and group operations all support CUDA Graph captures. This support requires a minimum CUDA version of 11.3.
+
+The following sample code shows how to capture computational kernels and NCCL operations in a CUDA Graph: ::
+
+  cudaGraph_t graph;
+  cudaStreamBeginCapture(stream);
+  kernel_A<<< ..., stream >>>(...);
+  kernel_B<<< ..., stream >>>(...);
+  ncclAllreduce(..., stream);
+  kernel_C<<< ..., stream >>>(...);
+  cudaStreamEndCapture(stream, &graph);
+
+  cudaGraphExec_t instance;
+  cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
+  cudaGraphLaunch(instance, stream);
+  cudaStreamSynchronize(stream);
+
+Starting with NCCL 2.11, when NCCL communication is captured and the CollNet algorithm is used, NCCL allows for further performance improvement via user buffer registration. For details, please see the environment variable :ref:`NCCL_GRAPH_REGISTER`.
+
+Having multiple outstanding NCCL operations that are any combination of graph-captured or non-captured is supported. There is a caveat that the mechanism NCCL uses internally to accomplish this has been seen to cause CUDA to deadlock when the graphs of multiple communicators are cudaGraphLaunch()'d from the same thread. To disable this mechansim see the environment variable :ref:`NCCL_GRAPH_MIXING_SUPPORT`.
+
+.. _user_buffer_reg:
+
+************************
+User Buffer Registration
+************************
+
+User Buffer Registration is a feature that allows NCCL to directly send/receive/operate data through the user buffer without extra internal copy (zero-copy).
+It can accelerate collectives and greatly reduce the resource usage (e.g. #channel usage). NCCL provides two ways to register user buffers; one is *CUDA Graph*
+registration, and the other is *Local* registration. NCCL requires that for all NCCL communication function calls (e.g., allreduce, sendrecv, and so on), if any
+rank in a communicator passes registered buffers to a NCCL communication function, all other ranks in the same communicator must pass their registered buffers;
+otherwise, mixing registered and non-registered buffers can result in undefined behavior.
+
+NVLink Sharp Buffer Registration
+--------------------------------
+
+Since 2.19.x, NCCL supports user buffer registration for NVLink Sharp (NVLS); any NCCL collectives (e.g., allreduce) that support NVLS algorithm can utilize this feature.
+
+To enable the *CUDA Graph* based buffer registration for NVLS, users have to comply with several requirements:
+
+ * The buffer is allocated through :c:func:`ncclMemAlloc` or a qualified allocator (see :ref:`mem_allocator`).
+ * The NCCL operation is launched on a stream captured by a CUDA graph for each rank.
+ * Offset to the head address of the buffer is the same in collectives for each rank.
+
+Registered buffers will be deregistered when the CUDA graph is destroyed. Here is a CUDA graph based buffer registration example:
+
+.. code:: C
+
+  void* sendbuff;
+  void* recvbuff;
+  size_t count = 1 << 25;
+  CHECK(ncclMemAlloc(&sendbuff, count * sizeof(float)));
+  CHECK(ncclMemAlloc(&recvbuff, count * sizeof(float)));
+
+  cudaGraph_t graph;
+  CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  CHECK(ncclAllReduce(sendbuff, recvbuff, 1024, ncclFloat, ncclSum, comm, stream));
+  // Same offset to the sendbuff and recvbuff head address for each rank
+  CHECK(ncclAllReduce((void*)((float*)sendbuff + 1024), (void*)((float*)recvbuff + 2048), 1024, ncclFloat, ncclSum, comm, stream));
+  CHECK(cudaStreamEndCapture(stream, &graph));
+
+  cudaGraphExec_t instance;
+  CHECK(cudaGraphInstantiate(&instance, graph, NULL, NULL, 0));
+  CHECK(cudaGraphLaunch(instance, stream));
+  CHECK(cudaStreamSynchronize(stream));
+  CHECK(cudaGraphExecDestroy(instance));
+  CHECK(cudaGraphDestroy(graph));
+
+  CHECK(ncclMemFree(sendbuff));
+  CHECK(ncclMemFree(recvbuff));
+
+On the other hand, to enable the *Local* based buffer registration for NVLS, users have to comply with the following requirements:
+
+ * The buffer is allocated through :c:func:`ncclMemAlloc` or a qualified allocator (see :ref:`mem_allocator`).
+ * Register buffer with :c:func:`ncclCommRegister` before calling collectives for each rank.
+ * Call NCCL collectives as usual but similarly keep the offset to the head address of the buffer the same for each rank.
+
+Registered buffers will be deregistered when users explicitly call :c:func:`ncclCommDeregister`. Here is a local based buffer registration example:
+
+.. code:: C
+
+  void* sendbuff;
+  void* recvbuff;
+  size_t count = 1 << 25;
+  void* sendRegHandle;
+  void* recvRegHandle;
+  CHECK(ncclMemAlloc(&sendbuff, count * sizeof(float)));
+  CHECK(ncclMemAlloc(&recvbuff, count * sizeof(float)));
+
+  CHECK(ncclCommRegister(comm, sendbuff, count * sizeof(float), &sendRegHandle));
+  CHECK(ncclCommRegister(comm, recvbuff, count * sizeof(float), &recvRegHandle));
+
+  CHECK(ncclAllReduce(sendbuff, recvbuff, 1024, ncclFloat, ncclSum, comm, stream));
+  CHECK(ncclAllReduce((void*)((float*)sendbuff + 1024), (void*)((float*)recvbuff + 2048), 1024, ncclFloat, ncclSum, comm, stream));
+  CHECK(cudaStreamSynchronize(stream));
+
+  CHECK(ncclCommDeregister(comm, sendRegHandle));
+  CHECK(ncclCommDeregister(comm, recvRegHandle));
+
+  CHECK(ncclMemFree(sendbuff));
+  CHECK(ncclMemFree(recvbuff));
+
+For local based registration, users can register the buffer once at the beginning of the program and reuse the buffer multiple times to utilize
+registration benefits.
+
+To save the memory, it is also valid to allocate a large chunk of buffer and register it once. `sendbuff` and `recvbuff` can be further
+allocated through the big chunk for zero-copy NCCL operations as long as `sendbuff` and `recvbuff` satisfy the offset requirements. The following
+example shows a use case:
+
+.. code:: C
+
+  void* buffer;
+  void* handle;
+  void* sendbuff;
+  void* recvbuff;
+  size_t size = 1 << 29;
+
+  CHECK(ncclMemAlloc(&buffer, size));
+  CHECK(ncclCommRegister(comm, buffer, size, &handle));
+
+  // assign buffer chunk to sendbuff and recvbuff
+  sendbuff = buffer;
+  recvbuff = (void*)((uint8_t*)buffer + (1 << 20));
+
+  CHECK(ncclAllReduce(sendbuff, recvbuff, 1024, ncclFloat, ncclSum, comm, stream));
+  CHECK(cudaStreamSynchronize(stream));
+
+  CHECK(ncclCommDeregister(comm, handle));
+
+  CHECK(ncclMemFree(sendbuff));
+
+IB Sharp Buffer Registration
+----------------------------
+
+NCCL 2.21.x supports IB Sharp buffer registration, any NCCL collectives that support IB Sharp algorithm can benefit from the feature such as allreduce,
+reducescatter, and allgather. Currently, NCCL only supports IB Sharp buffer registration for the communicators which contain 1 rank per node, and the
+registration can reduce the number of NCCL SM usage down to 1.
+
+To enable IB Sharp buffer registration by CUDA graph:
+
+ * Allocate send and recv buffer with any CUDA allcator (e.g., cudaMalloc/ncclMemAlloc)
+ * Launch NCCL collectives with CUDA graph
+
+To enable IB Sharp buffer registration by local registration:
+
+ * Allocate send and recv buffer with any CUDA allcator (e.g., cudaMalloc/ncclMemAlloc)
+ * Register send and recv buffer for each rank in the communicator with `ncclCommRegister`
+ * Launch NCCL collectives
+
+General Buffer Registration
+---------------------------
+
+Since 2.23.x, NCCL supports intra-node buffer registration, which targets all peer-to-peer intra-node communications and brings less memory access, fewer SM usage
+and performance improvement. Either registering buffers by `ncclCommRegister` in the beginning or applying CUDA graph can enable intra-node buffer registration for NCCL collectives and sendrecv.
+The registered buffers can be allocated through legacy cuda API (e.g., `cudaMalloc`) as well as VMM API (e.g., `cuMem*` or `ncclMemAlloc`). However, VMM-allocated buffers are highly recommended since it is safer than legacy buffers during failure and abort.
+
+.. _mem_allocator:
+
+Memory Allocator
+----------------
+
+For convenience, NCCL provides `ncclMemAlloc` function to help users to allocate buffers through VMM API, which can be used for NCCL registration later. It is only designed for NCCL so that it is not recommended to use `ncclMemAlloc` allocated buffers everywhere in the applications. For advanced users, if you want to create your own memory allocator for NVLS buffer registration, the allocator needs to satisfy the following requirements:
+
+ * Allocate buffer with shared flag `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` and also `CU_MEM_HANDLE_TYPE_FABRIC` on GPUs where it's supported.
+ * Buffer size is multiple of multicast recommended granularity (i.e. cuMulticastGetGranularity(..., `CU_MULTICAST_GRANULARITY_RECOMMENDED`))
+ * Buffer head address is at least aligned to multicast minimal granularity (i.e. cuMulticastGetGranularity(..., `CU_MULTICAST_GRANULARITY_MINIMUM`))
+
+.. _api-label:
+
+########
+NCCL API 
+########
+
+The following sections describe the NCCL methods and operations.
+
+.. toctree::
+
+ api/comms
+ api/colls
+ api/group
+ api/p2p
+ api/types
+ api/ops
+
+**********************************************
+Communicator Creation and Management Functions
+**********************************************
+
+The following functions are public APIs exposed by NCCL to create and manage the collective communication operations.
+
+ncclGetLastError
+----------------
+
+.. c:function:: const char* ncclGetLastError(ncclComm_t comm)
+
+Returns a human-readable string corresponding to the last error that occurred in NCCL.
+Note: The error is not cleared by calling this function.
+Please note that the string returned by ncclGetLastError could be unrelated to the current call
+and can be a result of previously launched asynchronous operations, if any.
+
+ncclGetErrorString
+------------------
+
+.. c:function:: const char* ncclGetErrorString(ncclResult_t result)
+
+Returns a human-readable string corresponding to the passed error code.
+
+ncclGetVersion
+--------------
+
+.. c:function:: ncclResult_t ncclGetVersion(int* version)
+
+The ncclGetVersion function returns the version number of the currently linked NCCL library.
+The NCCL version number is returned in *version* and encoded as an integer which includes the
+:c:macro:`NCCL_MAJOR`, :c:macro:`NCCL_MINOR` and :c:macro:`NCCL_PATCH` levels.
+The version number returned will be the same as the :c:macro:`NCCL_VERSION_CODE` defined in *nccl.h*.
+NCCL version numbers can be compared using the supplied macro; :c:macro:`NCCL_VERSION(MAJOR,MINOR,PATCH)`
+
+ncclGetUniqueId
+---------------
+
+.. c:function:: ncclResult_t ncclGetUniqueId(ncclUniqueId* uniqueId)
+
+Generates an Id to be used in ncclCommInitRank. ncclGetUniqueId should be
+called once when creating a communicator and the Id should be distributed to all ranks in the
+communicator before calling ncclCommInitRank. *uniqueId* should point to a ncclUniqueId object allocated by the user.
+
+ncclCommInitRank
+----------------
+
+.. c:function:: ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank)
+
+Creates a new communicator (multi thread/process version).
+*rank* must be between 0 and *nranks*-1 and unique within a communicator clique.
+Each rank is associated to a CUDA device, which has to be set before calling
+ncclCommInitRank.
+ncclCommInitRank implicitly synchronizes with other ranks, hence it must be
+called by different threads/processes or used within ncclGroupStart/ncclGroupEnd.
+
+ncclCommInitAll
+---------------
+
+.. c:function:: ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist)
+
+Creates a clique of communicators (single process version) in a blocking way.
+This is a convenience function to create a single-process communicator clique.
+Returns an array of *ndev* newly initialized communicators in *comms*.
+*comms* should be pre-allocated with size at least ndev*sizeof(:c:type:`ncclComm_t`).
+*devlist* defines the CUDA devices associated with each rank. If *devlist* is NULL,
+the first *ndev* CUDA devices are used, in order.
+
+ncclCommInitRankConfig
+----------------------
+
+.. c:function:: ncclResult_t ncclCommInitRankConfig(ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank, ncclConfig_t* config)
+
+This function works the same way as *ncclCommInitRank* but accepts a configuration argument of extra attributes for
+the communicator. If config is passed as NULL, the communicator will have the default behavior, as if ncclCommInitRank
+was called.
+
+See the :ref:`init-rank-config` section for details on configuration options.
+
+ncclCommInitRankScalable
+------------------------
+
+.. c:function:: ncclResult_t ncclCommInitRankScalable(ncclComm_t* newcomm, int nranks, int myrank, int nId, ncclUniqueId* commIds, ncclConfig_t* config)
+
+
+This function works the same way as *ncclCommInitRankConfig* but accepts a list of ncclUniqueIds instead of a single one.
+If only one ncclUniqueId is passed, the communicator will be initialized as if ncclCommInitRankConfig was called.
+The provided ncclUniqueIds will all be used to initalize the single communicator given in argument.
+
+See the :ref:`init-rank-config` section for details on how to create and distribute the list of ncclUniqueIds.
+
+ncclCommSplit
+-------------
+
+.. c:function:: ncclResult_t ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t* newcomm, ncclConfig_t* config)
+
+The *ncclCommSplit* is a collective function and creates a set of new communicators from an existing one. Ranks which 
+pass the same *color* value will be part of the same group; color must be a non-negative value. If it is 
+passed as *NCCL_SPLIT_NOCOLOR*, it means that the rank will not be part of any group, therefore returning NULL 
+as newcomm.
+The value of key will determine the rank order, and the smaller key means the smaller rank in new communicator.
+If keys are equal between ranks, then the rank in the original communicator will be used to order ranks.
+If the new communicator needs to have a special configuration, it can be passed as *config*, otherwise setting
+config to NULL will make the new communicator inherit the original communicator's configuration.
+When split, there should not be any outstanding NCCL operations on the *comm*. Otherwise, it might cause 
+a deadlock.
+
+
+ncclCommFinalize
+----------------
+
+.. c:function:: ncclResult_t ncclCommFinalize(ncclComm_t comm)
+
+Finalize a communicator object *comm*. When the communicator is marked as nonblocking, *ncclCommFinalize* is a 
+nonblocking function. Successful return from it will set communicator state as *ncclInProgress* and indicates 
+the communicator is under finalization where all uncompleted operations and the network-related resources are 
+being flushed and freed. 
+Once all NCCL operations are complete, the communicator will transition to the *ncclSuccess* state. Users 
+can query that state with *ncclCommGetAsyncError*.
+
+ncclCommDestroy
+---------------
+
+.. c:function:: ncclResult_t ncclCommDestroy(ncclComm_t comm)
+
+Destroy a communicator object *comm*.
+*ncclCommDestroy* only frees the local resources that are allocated to the communicator object *comm* if *ncclCommFinalize* 
+was previously called on the communicator; otherwise, *ncclCommDestroy* will call ncclCommFinalize internally. 
+If *ncclCommFinalize* is called by users, users should guarantee that the state of the communicator becomes *ncclSuccess* before 
+calling *ncclCommDestroy*. 
+In all cases, the communicator should no longer be accessed after ncclCommDestroy returns. It is recommended that 
+users call *ncclCommFinalize* and then *ncclCommDestroy*.
+This function is an intra-node collective call, which all ranks on the same node should call to avoid a hang.
+
+ncclCommAbort
+-------------
+
+.. c:function:: ncclResult_t ncclCommAbort(ncclComm_t comm)
+
+*ncclCommAbort* frees resources that are allocated to a communicator object *comm* and aborts any uncompleted
+operations before destroying the communicator. All active ranks are required to call this function in order to
+abort the NCCL communicator successfully. For more use cases, please check :ref:`ft`.
+
+ncclCommGetAsyncError
+---------------------
+
+.. c:function:: ncclResult_t ncclCommGetAsyncError(ncclComm_t comm, ncclResult_t* asyncError)
+
+Queries the progress and potential errors of asynchronous NCCL operations.
+Operations which do not require a stream argument (e.g. ncclCommFinalize) can be considered complete as soon
+as the function returns *ncclSuccess*; operations with a stream argument (e.g. ncclAllReduce) will return
+*ncclSuccess* as soon as the operation is posted on the stream but may also report errors through
+ncclCommGetAsyncError() until they are completed. If the return code of any NCCL function is *ncclInProgress*,
+it means the operation is in the process of being enqueued in the background, and users must query the states
+of the communicators until all the states become *ncclSuccess* before calling another NCCL function. Before the
+states change into *ncclSuccess*, users are not allowed to issue CUDA kernel to the streams being used by NCCL.
+If there has been an error on the communicator, user should destroy the communicator with :c:func:`ncclCommAbort`.
+If an error occurs on the communicator, nothing can be assumed about the completion or correctness of operations
+enqueued on that communicator.
+
+ncclCommCount
+-------------
+
+.. c:function:: ncclResult_t ncclCommCount(const ncclComm_t comm, int* count)
+
+Returns in *count* the number of ranks in the NCCL communicator *comm*.
+
+ncclCommCuDevice
+----------------
+
+.. c:function:: ncclResult_t ncclCommCuDevice(const ncclComm_t comm, int* device)
+
+Returns in *device* the CUDA device associated with the NCCL communicator *comm*. 
+
+ncclCommUserRank
+----------------
+
+.. c:function:: ncclResult_t ncclCommUserRank(const ncclComm_t comm, int* rank)
+
+Returns in *rank* the rank of the caller in the NCCL communicator *comm*.
+
+ncclCommRegister
+----------------
+
+.. c:function:: ncclResult_t ncclCommRegister(const ncclComm_t comm, void* buff, size_t size, void** handle)
+
+Registers the buffer *buff* with *size* under communicator *comm* for zero-copy communication; *handle* is
+returned for future deregistration. See *buff* and *size* requirements and more instructions in :ref:`user_buffer_reg`.
+
+ncclCommDeregister
+------------------
+
+.. c:function:: ncclResult_t ncclCommDeregister(const ncclComm_t comm, void* handle)
+
+Deregister buffer represented by *handle* under communicator *comm*.
+
+ncclMemAlloc
+------------
+
+.. c:function:: ncclResult_t ncclMemAlloc(void **ptr, size_t size)
+
+Allocate a GPU buffer with *size*. Allocated buffer head address will be returned by *ptr*,
+and the actual allocated size can be larger than requested because of the buffer granularity 
+requirements from all types of NCCL optimizations.
+
+ncclMemFree
+-----------
+
+.. c:function:: ncclResult_t ncclMemFree(void *ptr)
+
+Free memory allocated by *ncclMemAlloc()*.
+
+**********************************
+Collective Communication Functions
+**********************************
+
+
+The following NCCL APIs provide some commonly used collective operations.
+
+ncclAllReduce
+-------------
+
+.. c:function:: ncclResult_t  ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream)
+ 
+ Reduces data arrays of length ``count`` in ``sendbuff`` using the ``op`` operation and leaves identical copies of the result in each ``recvbuff``.
+ 
+ In-place operation will happen if ``sendbuff == recvbuff``.
+
+Related links: :ref:`allreduce`.
+
+
+ncclBroadcast
+-------------
+
+.. c:function:: ncclResult_t  ncclBroadcast(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, int root, ncclComm_t comm, cudaStream_t stream)
+ 
+ Copies ``count`` elements from ``sendbuff`` on the ``root`` rank to all ranks' ``recvbuff``.
+ ``sendbuff`` is only used on rank ``root`` and ignored for other ranks.
+ 
+ In-place operation will happen if ``sendbuff == recvbuff``.
+ 
+
+.. c:function:: ncclResult_t  ncclBcast(void* buff, size_t count, ncclDataType_t datatype, int root, ncclComm_t comm, cudaStream_t stream)
+ 
+ Legacy in-place version of ``ncclBroadcast`` in a similar fashion to MPI_Bcast. A call to ::
+  
+  ncclBcast(buff, count, datatype, root, comm, stream)
+ 
+ is equivalent to ::
+  
+  ncclBroadcast(buff, buff, count, datatype, root, comm, stream)
+
+Related links: :ref:`broadcast`
+
+ncclReduce
+----------
+
+.. c:function:: ncclResult_t  ncclReduce(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream)
+ 
+ Reduce data arrays of length ``count`` in ``sendbuff`` into ``recvbuff`` on the ``root`` rank using the ``op`` operation.
+ ``recvbuff`` is only used on rank ``root`` and ignored for other ranks.
+ 
+ In-place operation will happen if ``sendbuff == recvbuff``.
+
+Related links: :ref:`reduce`.
+
+ncclAllGather
+-------------
+
+.. c:function:: ncclResult_t  ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcount, ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream)
+ 
+ Gathers ``sendcount`` values from all GPUs and leaves identical copies of the result in each ``recvbuff``, receiving data from rank ``i`` at offset ``i*sendcount``.
+ 
+ Note: This assumes the receive count is equal to ``nranks*sendcount``, which means that ``recvbuff`` should have a size of at least ``nranks*sendcount`` elements.
+ 
+ In-place operation will happen if ``sendbuff == recvbuff + rank * sendcount``.
+
+Related links: :ref:`allgather`, :ref:`in-place-operations`.
+
+ncclReduceScatter
+-----------------
+
+.. c:function:: ncclResult_t  ncclReduceScatter(const void* sendbuff, void* recvbuff, size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream)
+ 
+ Reduce data in ``sendbuff`` from all GPUs using the ``op`` operation and leave the reduced result scattered over the devices so that the ``recvbuff`` on
+ rank ``i`` will contain the i-th block of the result.
+ 
+ Note:  This assumes the send count is equal to ``nranks*recvcount``, which means that ``sendbuff`` should have a size of at least ``nranks*recvcount`` elements.
+
+ In-place operation will happen if ``recvbuff == sendbuff + rank * recvcount``.
+
+Related links: :ref:`reducescatter`, :ref:`in-place-operations`.
